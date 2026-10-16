@@ -54,21 +54,9 @@ def main() -> int:
     a_rows, b_rows = load()
     a, b = outcomes_from_records(a_rows), outcomes_from_records(b_rows)
     eff = selection_effect(a, b, name_a="logged_at_claim", name_b="chosen_for_publication", n_boot=5000, seed=0)
-    print(eff.report())
-    print()
-
-    # 1. Do the numbers match the original analysis?
-    ok = True
-    for (pop, definition, drift), (k, n, (lo, hi)) in EXPECTED.items():
-        cell_a, cell_b = eff.cells[(definition, drift)]
-        cell = cell_a if pop == "logged_at_claim" else cell_b
-        got = (cell.errors, cell.checked, (round(100 * cell.wilson[0], 1), round(100 * cell.wilson[1], 1)))
-        match = got == (k, n, (lo, hi))
-        ok &= match
-        print(f"{'MATCH' if match else 'DIFF '} {pop} {definition}: expected {k}/{n} CI {lo}-{hi}, got {got[0]}/{got[1]} CI {got[2][0]}-{got[2][1]}")
-    print()
-
-    # 2. Is the verdict stable under the tunable cutoffs? Four settings:
+    # Gates first: nothing numeric is printed until the sweeps are stable and
+    # the canary passes.
+    # 1. Is the verdict stable under the tunable cutoffs? Four settings:
     #    strict/lenient x drift excluded/included. The winner must not change.
     settings = [(d, drift) for d in ("strict", "lenient") for drift in (False, True)]
     finding = sweep(settings, lambda s: eff.winner(s[0], drift_included=s[1]))
@@ -77,7 +65,7 @@ def main() -> int:
         print("REFUSING to report a headline: the winner depends on the cutoff.")
         return 2
 
-    # 3. Also sweep how unresolved rows are treated: best case, point, worst case.
+    # 2. Also sweep how unresolved rows are treated: best case, point, worst case.
     def winner_under(treatment: str) -> str:
         ca, cb = eff.cells[("strict", False)]
         pick = {"best": lambda c: c.best_case, "point": lambda c: c.rate, "worst": lambda c: c.worst_case}[treatment]
@@ -88,7 +76,7 @@ def main() -> int:
     if isinstance(finding2, FragileFinding):
         return 2
 
-    # 4. Canary: plant a known-false and a known-true row into a copy of the
+    # 3. Canary: plant a known-false and a known-true row into a copy of the
     #    published population and prove the error counter catches exactly the
     #    false one. Only then is the headline allowed out.
     bad = {"seq": -1, "kind": "numeric", "class": "wrong_at_publish", "strict": True, "lenient": True}
@@ -105,6 +93,19 @@ def main() -> int:
         print("canary FAILED:", exc)
         return 3
 
+    # 4. Only now, with the gates passed, print numbers: the report, then
+    #    whether they match the original analysis.
+    print()
+    print(eff.report())
+    print()
+    ok = True
+    for (pop, definition, drift), (k, n, (lo, hi)) in EXPECTED.items():
+        cell_a, cell_b = eff.cells[(definition, drift)]
+        cell = cell_a if pop == "logged_at_claim" else cell_b
+        got = (cell.errors, cell.checked, (round(100 * cell.wilson[0], 1), round(100 * cell.wilson[1], 1)))
+        match = got == (k, n, (lo, hi))
+        ok &= match
+        print(f"{'MATCH' if match else 'DIFF '} {pop} {definition}: expected {k}/{n} CI {lo}-{hi}, got {got[0]}/{got[1]} CI {got[2][0]}-{got[2][1]}")
     print()
     print("HEADLINE:", "numbers reproduce the original analysis" if ok else "numbers DIFFER from the original analysis (see above)")
     return 0 if ok else 1

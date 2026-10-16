@@ -25,6 +25,7 @@ HASH_LEN = 64
 CheckSpec = Union[str, Callable[[], Any]]
 
 __all__ = [
+    "Anchor",
     "Claim",
     "ChainError",
     "ChainReport",
@@ -83,11 +84,15 @@ def canonical_material(rec: Claim) -> str:
     ``meta`` is included via a sorted-key JSON dump so that annotations are
     tamper-evident too. Changing this function invalidates every existing chain,
     which is the intended property.
+
+    Each field is length-prefixed (``<utf-8 byte length>:<value>;``) behind a
+    version tag, so no choice of field contents can make two different records
+    produce the same material (a plain separator join could be forged by putting
+    the separator inside a field).
     """
     meta = json.dumps(rec.meta, sort_keys=True, ensure_ascii=False)
-    return "\x1f".join(
-        [str(rec.seq), rec.ts, rec.claim, rec.check, rec.observed, rec.kind, meta, rec.prev]
-    )
+    parts = [str(rec.seq), rec.ts, rec.claim, rec.check, rec.observed, rec.kind, meta, rec.prev]
+    return "he-v2;" + "".join(f"{len(p.encode('utf-8'))}:{p};" for p in parts)
 
 
 def hash_record(rec: Claim) -> str:
@@ -104,6 +109,50 @@ class ChainReport:
 
     def __bool__(self) -> bool:  # pragma: no cover - convenience
         return self.ok
+
+
+def _parse_ts(ts: str) -> datetime:
+    """Parse an ISO 8601 timestamp; naive times are refused (zone is required)."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ChainError(f"unparseable timestamp {ts!r}") from exc
+    if dt.tzinfo is None:
+        raise ChainError(f"timestamp {ts!r} has no timezone")
+    return dt
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """An externally published commitment to the chain: ``hash`` of row ``seq``.
+
+    A head file stored next to the ledger only proves internal consistency; whoever
+    can rewrite the ledger can rewrite the head too. An anchor lives somewhere the
+    ledger writer cannot silently change later, such as a git commit that was
+    pushed or otherwise published. ``verify_chain(..., anchor=a)`` requires the
+    chain to still contain row ``a.seq`` with hash ``a.hash``.
+    """
+
+    seq: int
+    hash: str
+    commit: str = ""
+
+    @classmethod
+    def from_git(cls, repo: Union[str, os.PathLike[str]], commit: str, head_relpath: str) -> "Anchor":
+        """Read the head file as it was recorded in ``commit`` (read-only git call)."""
+        import re
+        import subprocess
+
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit):
+            raise ChainError(f"anchor commit must be a hex sha, got {commit!r}")
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{commit}:{head_relpath}"],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode != 0:
+            raise ChainError(f"cannot read {head_relpath} at {commit}: {proc.stderr.strip()}")
+        head = json.loads(proc.stdout)
+        return cls(seq=int(head["seq"]), hash=str(head["hash"]), commit=commit)
 
 
 def _now_iso() -> str:
@@ -174,9 +223,13 @@ class Ledger:
             raise ChainError(f"refusing to append to a broken chain: {report.reason}")
         rows = self.records()
         prev = rows[-1].hash if rows else GENESIS
+        new_ts = ts or _now_iso()
+        new_dt = _parse_ts(new_ts)
+        if rows and new_dt < _parse_ts(rows[-1].ts):
+            raise ChainError(f"refusing backdated append: {new_ts} is before last row {rows[-1].ts}")
         rec = Claim(
             seq=(rows[-1].seq + 1) if rows else 1,
-            ts=ts or _now_iso(),
+            ts=new_ts,
             claim=claim,
             check=_check_name(check),
             observed="" if observed is None else str(observed),
@@ -197,12 +250,20 @@ class Ledger:
         os.replace(tmp, self.head_path)
 
 
-def verify_chain(ledger: Union[Ledger, str, os.PathLike[str]], *, raise_on_fail: bool = False) -> ChainReport:
+def verify_chain(
+    ledger: Union[Ledger, str, os.PathLike[str]],
+    *,
+    raise_on_fail: bool = False,
+    anchor: Optional[Anchor] = None,
+) -> ChainReport:
     """Verify prev-links, recomputed hashes, and that the file ends at the head.
 
     Detects: edited fields (hash mismatch), re-ordered or spliced rows (prev
     mismatch, seq gap), truncation (last hash != recorded head), and a head
-    file pointing past the data (same check). An empty ledger with no head is OK.
+    file pointing past the data (same check), timestamps that go backwards, and,
+    when an external ``anchor`` is given, a chain rewritten wholesale after the
+    anchor was published. Without an anchor a full consistent rewrite (rows and
+    head together) cannot be detected. An empty ledger with no head is OK.
     """
     led = ledger if isinstance(ledger, Ledger) else Ledger(ledger)
     try:
@@ -222,6 +283,7 @@ def verify_chain(ledger: Union[Ledger, str, os.PathLike[str]], *, raise_on_fail:
 
     prev = GENESIS
     expected_seq = 1
+    last_dt: Optional[datetime] = None
     for r in rows:
         if r.seq != expected_seq:
             return fail(f"seq gap: expected {expected_seq}, found {r.seq}", r.seq)
@@ -229,8 +291,22 @@ def verify_chain(ledger: Union[Ledger, str, os.PathLike[str]], *, raise_on_fail:
             return fail("prev mismatch (row spliced, reordered, or an earlier row removed)", r.seq)
         if len(r.hash) != HASH_LEN or hash_record(r) != r.hash:
             return fail("hash mismatch (record edited after writing)", r.seq)
+        try:
+            dt = _parse_ts(r.ts)
+        except ChainError as exc:
+            return fail(f"bad timestamp: {exc}", r.seq)
+        if last_dt is not None and dt < last_dt:
+            return fail("timestamp goes backwards (row backdated)", r.seq)
+        last_dt = dt
         prev = r.hash
         expected_seq += 1
+
+    if anchor is not None:
+        match = next((r for r in rows if r.seq == anchor.seq), None)
+        if match is None:
+            return fail(f"anchor {anchor.commit or '?'} commits to seq {anchor.seq}, which is not in the chain", anchor.seq)
+        if match.hash != anchor.hash:
+            return fail(f"anchor {anchor.commit or '?'} mismatch at seq {anchor.seq} (chain rewritten after anchoring)", anchor.seq)
 
     if head is None:
         if rows:

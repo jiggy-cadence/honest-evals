@@ -24,10 +24,14 @@ four things the usual eval stack does not give you:
    (`canary`), and that the headline does not depend on a knob (`cutoffs`).
 
 The worked example in `examples/` reproduces a real result from an agent's own
-records: 6/16 = 37.5% of claims logged at utterance were wrong, versus 3/77 =
-3.9% of claims the agent chose to publish with a check. The 10x gap is the
-selection effect, and `selection_effect.py` refuses to print it until the
-canary passes and the cutoff sweep is stable.
+records: 6/16 claims logged at utterance were wrong (37.5%, Wilson 95% CI
+19-61%), versus 3/77 claims the agent chose to publish with a check (3.9%,
+95% CI 1-11%). How big the gap is depends on how errors and drift are counted:
+the ratio runs from 2.6x (strict, drift counted as error) to 28.9x (lenient,
+drift excluded), and at the 2.6x definition it is not significant at 0.05
+(Fisher p=0.068). It is one agent's records, n=16 on one side.
+`selection_effect.py` runs the canary and the cutoff sweep first and prints no
+numbers until both pass.
 
 ## Install
 
@@ -56,22 +60,38 @@ assert rep.ok, rep.reason      # "hash mismatch (record edited...)", "truncated.
 Each record carries `prev` and `hash` (sha256 over every other field, including
 `meta`). A sidecar `claims.jsonl.head` records the last hash; a shortened file
 still has valid internal links, so the head check is what catches truncation.
-`append` refuses to extend a broken chain.
+`append` refuses to extend a broken chain and refuses a timestamp earlier than
+the last row; `verify_chain` flags backdated rows too. Fields are hashed with a
+length-prefixed encoding, so no field content can collide with another record.
+
+The head file only proves internal consistency: whoever can rewrite the ledger
+can rewrite the head. To catch a full rewrite, commit the head somewhere you
+cannot silently change later (e.g. a pushed git commit) and verify against it:
+
+```python
+from honest_evals import Anchor, verify_chain
+anchor = Anchor.from_git(".", "<commit sha>", "claims.jsonl.head")
+verify_chain("claims.jsonl", anchor=anchor)   # fails if the chain was rewritten after that commit
+```
 
 ### rerun: re-execute read-only checks, name every refusal
 
 ```python
 from honest_evals import rerun, Adjudication, RerunClass
 
-r = rerun({"seq": 1, "check": "wc -l < data.jsonl", "observed": "830"}, timeout=10)
+r = rerun({"seq": 1, "check": "wc -l data.jsonl", "observed": "830"}, timeout=10)
 r.cls      # still_true | drifted | wrong_at_publish | not_rerunnable
-r.reason   # "rerun_matches_observed", "denylist:curl", "timeout_after_10s",
+r.reason   # "rerun_matches_observed", "not_allowlisted:curl", "timeout_after_10s",
            # "mismatch_unadjudicated: rerun='842' observed='830'", ...
 ```
 
-Commands run under `nice` with a timeout. Anything with a URL, an output
-redirect, a network tool, a write verb, `git push`/`fetch`, or an inline
-`open(..., 'w')` is refused with a named reason. A mismatch is **never**
+Commands run under `nice` with a timeout, and only if they pass an
+**allowlist**: every `|` or `&&` stage must be a known read-only program
+(`cat`, `grep`, `wc`, `git log`, `git branch` as a listing, ...). Anything else
+is refused with a named reason, as is any shell metacharacter that could
+substitute, redirect, group or sequence (`$ \` ; < > ( ) { }`, newlines, a
+lone `&`) anywhere in the string, any URL and any `/dev/tcp`. Only a literal
+`2>&1` is accepted. A mismatch is **never**
 auto-classified as drift: you either pass an `Adjudication` with evidence, or
 mark the record `snapshot=True` with a `snapshot_reason`, or it stays
 unresolved. If the record carries `expected` (what the claim asserted) and it
@@ -99,9 +119,14 @@ from honest_evals import canary, Canary, CanaryFailed
 def find_bad(rows):
     return [r["id"] for r in rows if r["bad"]]
 
-find_bad(rows)   # runs the canary on a copy first; raises CanaryFailed if the
-                 # false plant is missed or the true plant is flagged
+find_bad(rows)   # plants both items into this call's data at seeded random
+                 # positions, calls the checker once, raises CanaryFailed if the
+                 # false plant is missed or the true plant is flagged, and
+                 # returns the flags with the plants stripped
 ```
+
+Every call is canaried, so a checker that behaves only on its first call is
+caught on the next. Pass `seed=` to change the (reproducible) positions.
 
 Or as a context manager: `with Canary(rows, false_item=..., true_item=..., key=...) as c:
 c.observe(find_bad(c.data))`. Leaving the block without a passing observation raises.
@@ -124,10 +149,10 @@ with no `winner`.
 
 ## Honest limits
 
-- **The denylist is a refusal list, not a sandbox.** It catches the obvious
-  (URLs, redirects, `rm`, `curl`, `git push`, inline file writes) and will miss
-  a determined command. Run re-runs in a throwaway checkout if the commands are
-  not yours.
+- **The allowlist is not a sandbox.** It refuses anything it does not
+  recognise, but an allowed program can still read any file the process can,
+  and a hostile repo config can change what `git` runs. Run re-runs in a
+  throwaway checkout if the commands are not yours.
 - **A re-run of your own check reproduces your own wrongness.** If the recorded
   command measures something adjacent to the claim, `still_true` means the
   command still prints the same thing, not that the claim is true. The example

@@ -6,18 +6,19 @@ from honest_evals.rerun import Adjudication, RerunClass, refusal_reason, rerun, 
 @pytest.mark.parametrize(
     "cmd, prefix",
     [
-        ("curl -s https://example.com", "denylist:"),
-        ("wget http://x", "denylist:"),
-        ("rm -rf build", "denylist:rm"),
-        ("echo hi > out.txt", "denylist:output_redirect"),
-        ("cat a | tee b", "denylist:tee"),
-        ("cd repo && git push origin main", "denylist:git_push"),
-        ("git fetch --all", "denylist:git_fetch"),
-        ("sed -i 's/a/b/' f", "denylist:"),
-        ("python3 -c \"open('x','w').write('1')\"", "denylist:inline_file_write"),
-        ("node -e \"fetch('http://a')\"", "denylist:"),
-        ("pip install foo", "denylist:pip"),
-        ("sudo ls", "denylist:sudo"),
+        ("curl -s https://example.com", "refused:network"),
+        ("wget http://x", "refused:network"),
+        ("rm -rf build", "not_allowlisted:rm"),
+        ("echo hi > out.txt", "refused:shell_metachar"),
+        ("cat a | tee b", "not_allowlisted:tee"),
+        ("cd repo && git push origin main", "not_allowlisted:cd"),
+        ("git push origin main", "not_allowlisted:git_push"),
+        ("git fetch --all", "not_allowlisted:git_fetch"),
+        ("sed -i 's/a/b/' f", "not_allowlisted:sed"),
+        ("python3 -c \"open('x','w').write('1')\"", "refused:shell_metachar"),
+        ("node -e \"fetch('http://a')\"", "refused:"),
+        ("pip install foo", "not_allowlisted:pip"),
+        ("sudo ls", "not_allowlisted:sudo"),
         ("", "no_command_recorded"),
     ],
 )
@@ -28,7 +29,7 @@ def test_refused(cmd: str, prefix: str) -> None:
 
 @pytest.mark.parametrize(
     "cmd",
-    ["echo 1", "wc -l file.txt", "git log --oneline -1", "git grep -c foo", "ls -la 2>&1", "python3 -c 'print(2+2)'", "cat a | grep b | wc -l"],
+    ["echo 1", "wc -l file.txt", "git log --oneline -1", "git grep -c foo", "ls -la 2>&1", "cat a | grep b | wc -l"],
 )
 def test_allowed(cmd: str) -> None:
     assert refusal_reason(cmd) is None, cmd
@@ -41,7 +42,7 @@ def test_still_true() -> None:
 
 def test_refused_is_not_rerunnable_with_reason() -> None:
     r = rerun({"seq": 2, "check": "curl -s https://x", "observed": "200"})
-    assert r.cls is RerunClass.NOT_RERUNNABLE and r.reason.startswith("denylist:") and not r.checked
+    assert r.cls is RerunClass.NOT_RERUNNABLE and r.reason.startswith("refused:network") and not r.checked
 
 
 def test_timeout() -> None:

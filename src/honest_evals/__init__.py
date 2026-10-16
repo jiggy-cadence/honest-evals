@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from .canary import Canary, CanaryFailed, CanaryVerdict, canary, run_canary
 from .cutoffs import FragileFinding, StableFinding, sweep
-from .ledger import ChainError, ChainReport, Claim, Ledger, verify_chain
+from .ledger import Anchor, ChainError, ChainReport, Claim, Ledger, verify_chain
 from .rerun import Adjudication, RerunClass, RerunResult, refusal_reason, rerun, rerun_many
 from .selection import (
     Outcome,
@@ -31,7 +31,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "Adjudication", "Canary", "CanaryFailed", "CanaryVerdict", "ChainError", "ChainReport", "Claim",
-    "FragileFinding", "Ledger", "Outcome", "ProportionTest", "RateCell", "RerunClass", "RerunResult",
+    "Anchor", "FragileFinding", "Ledger", "Outcome", "ProportionTest", "RateCell", "RerunClass", "RerunResult",
     "SelectionEffect", "StableFinding", "bootstrap_interval", "canary", "outcomes_from_records",
     "rate_cell", "refusal_reason", "rerun", "rerun_many", "run_canary", "selection_effect", "sweep",
     "two_proportion_test", "verify_chain", "wilson_interval",

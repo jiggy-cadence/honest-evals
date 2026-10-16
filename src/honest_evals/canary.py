@@ -3,7 +3,7 @@ caught a known-false item and passed a known-true one.
 
 The checker is any callable ``checker(data) -> flagged`` where ``flagged`` is
 an iterable of the items (or item keys) it considers wrong. The canary copies
-``data``, appends a known-false and a known-true item, runs the checker on the
+``data``, inserts a known-false and a known-true item at seeded random positions, runs the checker on the
 copy, and only then lets the checker's verdict on the *real* data through.
 
 A checker that flags nothing fails (it missed the planted false item). A
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import random
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
@@ -57,29 +58,23 @@ def _identity(x: Any) -> Any:
     return x
 
 
-def run_canary(
-    checker: Checker[T],
-    data: Sequence[T],
-    *,
-    false_item: T,
-    true_item: T,
-    key: Callable[[T], Hashable] = _identity,
-) -> CanaryVerdict:
-    """Run ``checker`` on a copy of ``data`` with both plants appended."""
+def _plant(data: Sequence[T], false_item: T, true_item: T, rng: random.Random) -> List[T]:
+    """Deep-copy ``data`` and insert both plants at random positions from ``rng``."""
     planted: List[T] = list(copy.deepcopy(data))
-    planted.append(copy.deepcopy(false_item))
-    planted.append(copy.deepcopy(true_item))
-    try:
-        flagged = checker(planted)
-    except Exception as exc:  # noqa: BLE001 - a crashing checker is not a passing one
-        return CanaryVerdict(False, False, False, f"checker raised {exc.__class__.__name__}: {exc}", 0)
+    for item in (false_item, true_item):
+        planted.insert(rng.randint(0, len(planted)), copy.deepcopy(item))
+    return planted
+
+
+def _judge(flagged: Flagged, false_item: Any, true_item: Any, key: Callable[[Any], Hashable]) -> tuple[CanaryVerdict, list[Any]]:
+    flagged = list(flagged)
     # The checker may return items or already-extracted keys; accept both.
-    flagged_keys: set[Hashable] = set()
+    flagged_keys: list[Hashable] = []
     for f in flagged:
         try:
-            flagged_keys.add(key(f))
+            flagged_keys.append(key(f))
         except (TypeError, KeyError, AttributeError, IndexError):
-            flagged_keys.add(f)
+            flagged_keys.append(f)
     fk, tk = key(false_item), key(true_item)
     caught = fk in flagged_keys
     passed_true = tk not in flagged_keys
@@ -91,7 +86,28 @@ def run_canary(
         reason = "canary FAIL: planted false item was not caught (a no-op checker would look clean)"
     else:
         reason = "canary FAIL: planted true item was flagged (checker flags indiscriminately)"
-    return CanaryVerdict(caught and passed_true, caught, passed_true, reason, len(flagged_keys))
+    real = [f for f, k in zip(flagged, flagged_keys) if k != fk and k != tk]
+    return CanaryVerdict(caught and passed_true, caught, passed_true, reason, len(set(flagged_keys))), real
+
+
+def run_canary(
+    checker: Checker[T],
+    data: Sequence[T],
+    *,
+    false_item: T,
+    true_item: T,
+    key: Callable[[T], Hashable] = _identity,
+    seed: Optional[int] = 0,
+) -> CanaryVerdict:
+    """Run ``checker`` on a copy of ``data`` with both plants inserted at
+    positions drawn from ``random.Random(seed)`` (reproducible for a fixed seed)."""
+    planted = _plant(data, false_item, true_item, random.Random(seed))
+    try:
+        flagged = checker(planted)
+        verdict, _ = _judge(flagged, false_item, true_item, key)
+    except Exception as exc:  # noqa: BLE001 - a crashing checker is not a passing one
+        return CanaryVerdict(False, False, False, f"checker raised {exc.__class__.__name__}: {exc}", 0)
+    return verdict
 
 
 def canary(
@@ -99,16 +115,32 @@ def canary(
     false_item: Any,
     true_item: Any,
     key: Callable[[Any], Hashable] = _identity,
+    seed: Optional[int] = 0,
 ) -> Callable[[Checker[T]], Callable[[Sequence[T]], List[Any]]]:
-    """Decorator: the wrapped checker runs its canary before every real call."""
+    """Decorator: every real call is canaried.
+
+    The plants are inserted into the *real* call's data at positions drawn from a
+    per-wrapper ``random.Random(seed)``, the checker is called exactly once, and
+    its flags on the plants are judged and then stripped from the result. So the
+    canaried call and the real call are the same call: a checker cannot behave
+    on a separate canary call and misbehave on the real one, and it cannot find
+    the plants by a fixed position. A fixed ``seed`` makes runs reproducible.
+    """
 
     def deco(checker: Checker[T]) -> Callable[[Sequence[T]], List[Any]]:
+        rng = random.Random(seed)
+
         @functools.wraps(checker)
         def guarded(data: Sequence[T]) -> List[Any]:
-            verdict = run_canary(checker, data, false_item=false_item, true_item=true_item, key=key)
+            planted = _plant(data, false_item, true_item, rng)
+            try:
+                flagged = checker(planted)
+                verdict, real = _judge(flagged, false_item, true_item, key)
+            except Exception as exc:  # noqa: BLE001
+                raise CanaryFailed(CanaryVerdict(False, False, False, f"checker raised {exc.__class__.__name__}: {exc}", 0)) from exc
             if not verdict.passed:
                 raise CanaryFailed(verdict)
-            return list(checker(data))
+            return real
 
         guarded.canary_verdict = lambda data: run_canary(checker, data, false_item=false_item, true_item=true_item, key=key)  # type: ignore[attr-defined]
         return guarded
@@ -128,15 +160,16 @@ class Canary(Generic[T]):
         false_item: T,
         true_item: T,
         key: Callable[[T], Hashable] = _identity,
+        seed: Optional[int] = 0,
     ):
         self._key = key
         self.false_item = copy.deepcopy(false_item)
         self.true_item = copy.deepcopy(true_item)
-        self.data: List[T] = list(copy.deepcopy(data)) + [self.false_item, self.true_item]
+        self.data: List[T] = _plant(data, self.false_item, self.true_item, random.Random(seed))
         self.verdict: Optional[CanaryVerdict] = None
 
     def observe(self, flagged: Flagged) -> CanaryVerdict:
-        self.verdict = run_canary(lambda _d: flagged, self.data, false_item=self.false_item, true_item=self.true_item, key=self._key)
+        self.verdict, _ = _judge(flagged, self.false_item, self.true_item, self._key)
         return self.verdict
 
     def __enter__(self) -> "Canary[T]":

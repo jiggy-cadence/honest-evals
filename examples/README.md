@@ -26,6 +26,9 @@ a_rows, b_rows = load()                 # split by population
 a, b = outcomes_from_records(a_rows), outcomes_from_records(b_rows)
 ```
 
+The script runs these steps as gates in the order 3, 4, 1, 2: the cutoff
+sweep and the canary must pass before any rate or headline is printed.
+
 ## Step 1: rates at every cutoff
 
 ```python

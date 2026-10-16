@@ -12,7 +12,7 @@ Classes (``RerunClass``):
                          or by record-consistency: the record carries the value
                          the claim asserted (``expected``) and it differs from
                          the value the check produced at the time (``observed``).
-* ``not_rerunnable``   - refused (denylist, no command, timeout, crash) or a
+* ``not_rerunnable``   - refused (not allowlisted, no command, timeout, crash) or a
                          mismatch nobody has adjudicated. Always carries a
                          named reason. These rows count as *unresolved* in the
                          denominator, never as true.
@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 __all__ = [
     "Adjudication",
-    "DENYLIST",
+    "ALLOWLIST",
     "RerunClass",
     "RerunResult",
     "refusal_reason",
@@ -49,69 +49,105 @@ class RerunClass(str, Enum):
     NOT_RERUNNABLE = "not_rerunnable"
 
 
-# Words that, as a shell token, mean "this command may talk to the network or
-# change state". The denylist is a refusal list, not a sandbox: a command that
-# passes it is still run with a timeout under `nice`, and the caller chooses cwd.
-DENYLIST: frozenset[str] = frozenset(
+# Allowlist: a command may run only if every pipeline stage is one of these
+# read-only programs, with only the arguments allowed below. Everything else is
+# refused with a named reason. This is still not a sandbox: an allowed command is
+# run with a timeout under `nice`, and the caller chooses cwd.
+ALLOWLIST: frozenset[str] = frozenset(
     {
-        # network
-        "curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp", "rsync", "telnet", "ftp",
-        "pip", "pip3", "npm", "npx", "yarn", "pnpm", "apt", "apt-get", "brew", "docker",
-        "fetch", "ping", "dig", "nslookup",
-        # write verbs
-        "rm", "mv", "cp", "dd", "tee", "truncate", "touch", "mkdir", "rmdir", "ln", "chmod",
-        "chown", "install", "sed", "perl", "kill", "pkill", "killall", "shred", "unlink",
-        "sudo", "su", "doas", "crontab", "systemctl", "service", "reboot", "shutdown",
+        "echo", "printf", "cat", "wc", "grep", "egrep", "fgrep", "head", "tail", "ls", "sort",
+        "uniq", "cut", "tr", "jq", "sha256sum", "sha1sum", "md5sum", "stat", "test", "[",
+        "date", "true", "false", "sleep", "basename", "dirname", "realpath", "diff", "cmp",
+        "comm", "nl", "file", "du", "df", "pwd", "seq", "git",
     }
 )
-# git and similar tools are allowed only with read-only subcommands.
-_SUBCOMMAND_ALLOW: dict[str, frozenset[str]] = {
-    "git": frozenset({"log", "show", "grep", "status", "diff", "rev-parse", "ls-files", "cat-file", "branch", "tag", "describe"}),
+# Per-command argument prefixes that write files or run other programs.
+_ARG_DENY: dict[str, tuple[str, ...]] = {
+    "sort": ("-o", "--output", "--compress-program"),
+    "date": ("-s", "--set"),
+    "tail": ("-f", "-F", "--follow"),
+    "diff": ("--to-file", "--from-file"),
 }
-_WRITE_REDIRECT = re.compile(r"(^|[^<>])>{1,2}(?!&[12])")  # `>` or `>>` not part of `2>&1`
-_NETWORK_HINT = re.compile(r"https?://|wss?://|ftp://", re.IGNORECASE)
-_SED_INPLACE = re.compile(r"\bsed\b[^|;&]*\s-i")
-_PY_WRITE = re.compile(r"open\([^)]*['\"][wa][b+]*['\"]")
+_GIT_READ = frozenset({"log", "show", "grep", "status", "diff", "rev-parse", "ls-files", "cat-file", "describe", "branch", "tag"})
+_GIT_ARG_DENY = ("--output", "-O", "--open-files-in-pager", "--ext-diff", "--textconv", "--exec", "--upload-pack", "--receive-pack")
+# `git branch` / `git tag` are read-only only as listings.
+_GIT_LIST_FLAGS = {
+    "branch": frozenset({"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "--no-color", "--color=never"}),
+    "tag": frozenset({"--list", "-l", "-n"}),
+}
+_METACHARS = set("$`\\;<>(){}\n\r")
+_NETWORK_HINT = re.compile(r"https?://|wss?://|ftp://|/dev/(tcp|udp)/", re.IGNORECASE)
+_SEPARATORS = frozenset({"|", "&&"})
 
 
 def _tokens(cmd: str) -> list[str]:
-    try:
-        return shlex.split(cmd, posix=True)
-    except ValueError:
-        return cmd.split()
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars="|&")
+    lex.whitespace_split = True
+    return list(lex)
+
+
+def _check_stage(argv: list[str]) -> Optional[str]:
+    prog = argv[0]
+    if "/" in prog or "=" in prog:
+        return f"not_allowlisted:{prog}"
+    if prog not in ALLOWLIST:
+        return f"not_allowlisted:{prog}"
+    args = argv[1:]
+    for a in args:
+        if a.startswith(_ARG_DENY.get(prog, ())):
+            return f"not_allowlisted:{prog}_{a.split('=', 1)[0]}"
+    if prog == "git":
+        if not args or args[0].startswith("-"):
+            return "not_allowlisted:git_global_option" if args else "not_allowlisted:git_no_subcommand"
+        sub, rest = args[0], args[1:]
+        if sub not in _GIT_READ:
+            return f"not_allowlisted:git_{sub}"
+        for a in rest:
+            if a.startswith(_GIT_ARG_DENY):
+                return f"not_allowlisted:git_{sub}_{a.split('=', 1)[0]}"
+        if sub in _GIT_LIST_FLAGS and any(a not in _GIT_LIST_FLAGS[sub] for a in rest):
+            return f"not_allowlisted:git_{sub}_write_form"
+    return None
 
 
 def refusal_reason(cmd: str) -> Optional[str]:
     """Return a named reason to refuse ``cmd``, or ``None`` if it may run.
 
-    This is conservative on purpose. Inline scripts (``python -c``, ``node -e``)
-    are inspected for obvious write/network patterns but a dedicated reviewer is
-    still the only real guarantee.
+    Allowlist, not denylist: the command must be a pipeline (``|``) or ``&&``
+    chain of allowlisted read-only programs. Any shell metacharacter that can
+    substitute, redirect, group or sequence (``$ ` \\ ; < > ( ) { }``, newlines,
+    a lone ``&``) is refused anywhere in the string, even inside quotes. The only
+    redirect accepted is a literal ``2>&1``.
     """
     if not cmd or not cmd.strip():
         return "no_command_recorded"
     if _NETWORK_HINT.search(cmd):
-        return "denylist:network_url"
-    if _WRITE_REDIRECT.search(cmd):
-        return "denylist:output_redirect"
-    if _SED_INPLACE.search(cmd):
-        return "denylist:sed_inplace"
-    if _PY_WRITE.search(cmd):
-        return "denylist:inline_file_write"
-    toks = _tokens(cmd)
-    # look at every token so `a | rm b` and `cd x && curl y` are caught.
-    for i, tok in enumerate(toks):
-        base = tok.rsplit("/", 1)[-1]
-        if base in DENYLIST:
-            return f"denylist:{base}"
-        if base in _SUBCOMMAND_ALLOW:
-            sub = next((t for t in toks[i + 1 :] if not t.startswith("-")), "")
-            if sub not in _SUBCOMMAND_ALLOW[base]:
-                return f"denylist:{base}_{sub or 'no_subcommand'}"
-        if base in {"http.request", "requests.get", "urllib.request"}:
-            return "denylist:network_call"
-    if re.search(r"\b(requests|urllib|http\.client|socket|fetch)\b", cmd):
-        return "denylist:network_library"
+        return "refused:network"
+    stripped = re.sub(r"(?<!\S)2>&1(?!\S)", " ", cmd)
+    bad = sorted({c for c in stripped if c in _METACHARS})
+    if bad:
+        return "refused:shell_metachar:" + "".join(repr(c)[1:-1] for c in bad)
+    try:
+        toks = _tokens(stripped)
+    except ValueError:
+        return "refused:unparseable"
+    stage: list[str] = []
+    stages: list[list[str]] = []
+    for t in toks:
+        if t and set(t) <= {"|", "&"}:
+            if t not in _SEPARATORS or not stage:
+                return f"refused:shell_operator:{t}"
+            stages.append(stage)
+            stage = []
+        else:
+            stage.append(t)
+    if not stage:
+        return "refused:dangling_operator"
+    stages.append(stage)
+    for st in stages:
+        why = _check_stage(st)
+        if why:
+            return why
     return None
 
 
